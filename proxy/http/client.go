@@ -4,6 +4,7 @@ package http
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"io"
@@ -64,6 +65,19 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 	}, nil
 }
 
+//判断http method
+var  normalMethod = [][]byte{
+	[]byte(http.MethodGet),
+	[]byte(http.MethodHead),
+	[]byte(http.MethodPost),
+	[]byte(http.MethodPut),
+	[]byte(http.MethodPatch),
+	[]byte(http.MethodDelete),
+	[]byte(http.MethodOptions),
+	[]byte(http.MethodTrace),
+}
+var normalMethodLen = cap(normalMethod)
+
 // Process implements proxy.Outbound.Process. We first create a socket tunnel via HTTP CONNECT method, then redirect all inbound traffic to that tunnel.
 func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbound := session.OutboundFromContext(ctx)
@@ -89,11 +103,32 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	buf.ReleaseMulti(mbuf)
 	defer bytespool.Free(firstPayload)
 
+	// isNormalReq 是否为普通http代理
+	isNormalReq := func(firstPayload []byte) bool {
+		for i := 0; i < normalMethodLen; i++ {
+			if bytes.HasPrefix(firstPayload, normalMethod[i]) {
+				return true
+			}
+		}
+		return false
+	}
+
 	if err := retry.ExponentialBackoff(5, 100).On(func() error {
 		server := c.serverPicker.PickServer()
 		dest := server.Destination()
 		user = server.PickUser()
-
+		if isNormalReq(firstPayload) {
+			netConn, err := dialer.Dial(ctx, dest)
+			if err != nil {
+				return err
+			}
+			if _, err := netConn.Write(firstPayload); err != nil {
+				netConn.Close()
+				return err
+			}
+			conn = netConn
+			return nil
+		}
 		netConn, err := setUpHTTPTunnel(ctx, dest, targetAddr, user, dialer, firstPayload)
 		if netConn != nil {
 			if _, ok := netConn.(*http2Conn); !ok {
